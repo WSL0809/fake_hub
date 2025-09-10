@@ -241,7 +241,8 @@ def _write_paths_info_sidecar(dst_root: str, created_paths: List[str], dry_run: 
     """Write .paths-info.json reflecting ACTUAL on-disk files under dst_root.
 
     - Computes size and hashes from the created files to avoid metadata drift.
-    - Each entry: {path, type: "file", size, oid: <sha1>, lfs: {oid: "sha256:<hex>", size}}
+    - Each entry: {path, type: "file", size, oid: <sha1>, etag: <sha1>,
+      lfs: {oid: "sha256:<hex>", size}}
     - If dry_run is True, returns the intended sidecar path without writing.
     """
     entries = []
@@ -256,6 +257,7 @@ def _write_paths_info_sidecar(dst_root: str, created_paths: List[str], dry_run: 
             "type": "file",
             "size": int(size),
             "oid": sha1_hex,
+            "etag": sha1_hex,
             "lfs": {"oid": f"sha256:{sha256_hex}", "size": int(size)},
         }
         entries.append(rec)
