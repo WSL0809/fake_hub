@@ -3,6 +3,7 @@ import time
 import uuid
 import json as _json
 import hashlib
+from threading import RLock
 import logging
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Response
@@ -120,17 +121,25 @@ def get_file_size(filepath):
     """获取文件大小（字节）"""
     return os.path.getsize(filepath)
 
-def get_file_sha256(filepath):
-    """计算文件的 SHA256 哈希值"""
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+#
+# 哈希计算缓存：按 (abs_path, size, mtime) 作为键，缓存 (sha1_hex, sha256_hex)
+# 以避免在多次请求或同一请求内重复扫描大文件。
+#
+_HASH_CACHE: dict[tuple[str, int, float], tuple[str, str]] = {}
+_HASH_LOCK = RLock()
 
+def _hash_cache_key(filepath: str) -> tuple[str, int, float]:
+    abs_path = os.path.abspath(filepath)
+    try:
+        size = os.path.getsize(abs_path)
+        mtime = os.path.getmtime(abs_path)
+    except FileNotFoundError:
+        # 允许上层抛 404
+        size = -1
+        mtime = -1.0
+    return (abs_path, size, mtime)
 
-def get_file_hashes(filepath):
-    """一次读取计算 SHA-1 和 SHA-256，返回 (sha1_hex, sha256_hex)。"""
+def _compute_file_hashes(filepath: str) -> tuple[str, str]:
     h1 = hashlib.sha1()
     h256 = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -138,6 +147,31 @@ def get_file_hashes(filepath):
             h1.update(chunk)
             h256.update(chunk)
     return h1.hexdigest(), h256.hexdigest()
+
+def get_file_sha256(filepath):
+    """获取文件的 SHA256（带缓存）。"""
+    key = _hash_cache_key(filepath)
+    with _HASH_LOCK:
+        cached = _HASH_CACHE.get(key)
+        if cached is not None:
+            return cached[1]
+    sha1_hex, sha256_hex = _compute_file_hashes(filepath)
+    with _HASH_LOCK:
+        _HASH_CACHE[key] = (sha1_hex, sha256_hex)
+    return sha256_hex
+
+
+def get_file_hashes(filepath):
+    """获取 (SHA-1, SHA-256)（带缓存）。"""
+    key = _hash_cache_key(filepath)
+    with _HASH_LOCK:
+        cached = _HASH_CACHE.get(key)
+        if cached is not None:
+            return cached
+    sha1_hex, sha256_hex = _compute_file_hashes(filepath)
+    with _HASH_LOCK:
+        _HASH_CACHE[key] = (sha1_hex, sha256_hex)
+    return sha1_hex, sha256_hex
 
 def _build_model_response(repo_id: str, revision: Optional[str] = None) -> dict:
     repo_path = os.path.join(FAKE_HUB_ROOT, repo_id)
@@ -379,60 +413,29 @@ def _collect_paths_info(base_dir: str, rel_prefix: str | None = None) -> list[di
         rel_norm = rel_path.replace(os.sep, "/")
         sc = sidecar_map.get(rel_norm)
         if sc is not None:
-            # Prefer sidecar but ensure consistency with on-disk size and OIDs.
+            # 仅回传 sidecar 中已有的 OID 字段，不进行任何哈希计算或一致性校验。
             rec = {"path": rel_norm, "type": "file"}
             actual_size = get_file_size(abs_path)
-            rec["size"] = actual_size  # always report real file size to avoid confusion
-
-            # Gather sidecar sizes for comparison
-            sc_size = sc.get("size") if isinstance(sc.get("size"), int) else None
-            sc_lfs_size = None
-            if isinstance(sc.get("lfs"), dict) and isinstance(sc["lfs"].get("size"), int):
-                sc_lfs_size = sc["lfs"]["size"]
-
-            # Decide whether to trust sidecar hashes: only when sizes match
-            sizes_known = [s for s in (sc_size, sc_lfs_size) if isinstance(s, int)]
-            trust_sidecar_hashes = (len(sizes_known) > 0) and all(s == actual_size for s in sizes_known)
-
-            lfs = {}
-            if trust_sidecar_hashes:
-                # Use sidecar hashes when sizes agree
-                if isinstance(sc.get("oid"), str):
-                    rec["oid"] = sc["oid"]
-                if isinstance(sc.get("lfs"), dict) and isinstance(sc["lfs"].get("oid"), str):
-                    lfs["oid"] = sc["lfs"]["oid"]
-                # ensure lfs size reflects actual file size
-                lfs["size"] = actual_size
-                # If any oid missing, compute to satisfy clients expecting both
-                need_sha1 = "oid" not in rec
-                need_sha256 = "oid" not in lfs
-                if need_sha1 or need_sha256:
-                    sha1_hex, sha256_hex = get_file_hashes(abs_path)
-                    if need_sha1:
-                        rec["oid"] = sha1_hex
-                    if need_sha256:
-                        lfs["oid"] = f"sha256:{sha256_hex}"
-            else:
-                # Sidecar sizes absent or mismatched: recompute to avoid stale metadata
-                sha1_hex, sha256_hex = get_file_hashes(abs_path)
-                rec["oid"] = sha1_hex
-                lfs["oid"] = f"sha256:{sha256_hex}"
-                lfs["size"] = actual_size
-
-            if lfs:
-                rec["lfs"] = lfs
+            rec["size"] = actual_size
+            if isinstance(sc.get("oid"), str):
+                rec["oid"] = sc["oid"]
+            if isinstance(sc.get("lfs"), dict):
+                ldict = {}
+                if isinstance(sc["lfs"].get("oid"), str):
+                    ldict["oid"] = sc["lfs"]["oid"]
+                # 始终报告真实大小
+                ldict["size"] = actual_size
+                if ldict:
+                    rec["lfs"] = ldict
             results.append(rec)
             return
 
-        # No sidecar: compute hashes on demand
+        # 无 sidecar：只提供 size，不进行任何哈希计算。
         size = get_file_size(abs_path)
-        sha1_hex, sha256_hex = get_file_hashes(abs_path)
         results.append({
             "path": rel_norm,
             "type": "file",
             "size": size,
-            "oid": sha1_hex,
-            "lfs": {"oid": f"sha256:{sha256_hex}", "size": size},
         })
 
     def walk_dir(root_abs: str, root_rel: str):
@@ -634,13 +637,11 @@ async def resolve_file_download(repo_id: str, revision: str, filename: str, requ
     # 对 HEAD 请求返回元数据头，便于 huggingface 客户端探测
     if request.method == "HEAD":
         size = get_file_size(filepath)
-        sha256 = get_file_sha256(filepath)
         headers = {
             "Content-Length": str(size),
             "Content-Type": "application/octet-stream",
             "Accept-Ranges": "bytes",
-            # 以下为兼容性头部，供客户端识别和缓存
-            "ETag": f'"{sha256}"',
+            # 兼容性头部（不再计算 ETag）
             "x-repo-commit": revision,
             "x-revision": revision,
         }

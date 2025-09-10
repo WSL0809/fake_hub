@@ -174,6 +174,8 @@ uv run python -m skeleton <repo_id> --repo-type {model|dataset} \
   --dst ./fake_hub/custom_root \
   --force \
   --fill --fill-size 16MiB --fill-content "FAKE"
+
+uv run python -m skeleton tencent/HunyuanImage-2.1 --repo-type model --fill --fill-size 1024MiB --fill-content "FAKE"
 ```
 
 说明：
