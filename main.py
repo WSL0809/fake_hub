@@ -298,76 +298,11 @@ async def get_dataset_info_at_revision(repo_id: str, revision: str, request: Req
 
 @app.post("/api/datasets/{repo_id:path}/paths-info/{revision}")
 async def get_dataset_paths_info(repo_id: str, revision: str, request: Request):
-    """Minimal implementation of the Hub "paths-info" endpoint for datasets.
-
-    Accepts an optional JSON body: {"paths": ["path1", "path2", ...], "expand": true}
-    - If paths omitted or empty: returns info for all files under the dataset root.
-    - For each path that is a directory: if expand is true (default), returns all files
-      under that directory; otherwise returns the directory entry only.
-    - For files: returns a single record with size.
-    """
+    """Minimal implementation of the Hub paths-info endpoint for datasets."""
     ds_path = os.path.join(FAKE_HUB_ROOT, "datasets", repo_id)
     if not os.path.isdir(ds_path):
         raise HTTPException(status_code=404, detail="Dataset not found")
-
-    # Parse body (gracefully handle empty/no body)
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-
-    paths = []
-    expand = True
-    if isinstance(body, dict):
-        p = body.get("paths")
-        if isinstance(p, list):
-            # Keep only strings
-            paths = [str(x) for x in p if isinstance(x, str)]
-        e = body.get("expand")
-        if isinstance(e, bool):
-            expand = e
-
-    results: list[dict] = []
-    if not paths:
-        results = _collect_paths_info(ds_path)
-    else:
-        for p in paths:
-            # Normalize: treat empty string or "/" as root
-            if p.strip() in {"", "/", "."}:
-                if expand:
-                    results.extend(_collect_paths_info(ds_path))
-                else:
-                    results.append({"path": "", "type": "directory"})
-                continue
-            if expand:
-                results.extend(_collect_paths_info(ds_path, p))
-            else:
-                # Only return the path itself (file or dir), but ensure files include oid/lfs.
-                norm_rel = p.strip().lstrip("/")
-                abs_target = os.path.abspath(os.path.join(ds_path, norm_rel))
-                if abs_target.startswith(os.path.abspath(ds_path) + os.sep) or abs_target == os.path.abspath(ds_path):
-                    if os.path.isdir(abs_target):
-                        results.append({"path": norm_rel.replace(os.sep, "/"), "type": "directory"})
-                    elif os.path.isfile(abs_target):
-                        # Reuse _collect_paths_info to include size and oid/lfs when possible
-                        file_infos = _collect_paths_info(ds_path, norm_rel)
-                        # Expect exactly one file entry; add if present
-                        for it in file_infos:
-                            if it.get("type") == "file":
-                                results.append(it)
-                                break
-
-    # Deduplicate results by (path, type)
-    seen = set()
-    unique: list[dict] = []
-    for it in results:
-        key = (it.get("path", ""), it.get("type", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(it)
-
-    return JSONResponse(content=unique)
+    return JSONResponse(content=await _paths_info_response(ds_path, request))
 
 
 @app.get("/api/datasets/{repo_id:path}")
@@ -389,11 +324,10 @@ def _collect_paths_info(base_dir: str, rel_prefix: str | None = None) -> list[di
     # Optional: load precomputed sidecar to avoid hashing large files
     sidecar_map: dict[str, dict] = {}
     try:
-        import json
         sidecar_path = os.path.join(base_dir, ".paths-info.json")
         if os.path.isfile(sidecar_path):
             with open(sidecar_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                data = _json.load(f)
             ents = data.get("entries") if isinstance(data, dict) else None
             if isinstance(ents, list):
                 for it in ents:
@@ -471,94 +405,14 @@ def _collect_paths_info(base_dir: str, rel_prefix: str | None = None) -> list[di
     return results
 
 
-@app.post("/api/datasets/{repo_id:path}/paths-info/{revision}")
-async def get_dataset_paths_info(repo_id: str, revision: str, request: Request):
-    """Minimal implementation of the Hub "paths-info" endpoint for datasets.
-
-    Accepts an optional JSON body: {"paths": ["path1", "path2", ...], "expand": true}
-    - If paths omitted or empty: returns info for all files under the dataset root.
-    - For each path that is a directory: if expand is true (default), returns all files
-      under that directory; otherwise returns the directory entry only.
-    - For files: returns a single record with size.
-    """
-    ds_path = os.path.join(FAKE_HUB_ROOT, "datasets", repo_id)
-    if not os.path.isdir(ds_path):
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    # Parse body (gracefully handle empty/no body)
+async def _paths_info_response(base_dir: str, request: Request) -> list[dict]:
+    """Shared logic for dataset and model ``paths-info`` endpoints."""
     try:
         body = await request.json()
     except Exception:
         body = None
 
-    paths = []
-    expand = True
-    if isinstance(body, dict):
-        p = body.get("paths")
-        if isinstance(p, list):
-            # Keep only strings
-            paths = [str(x) for x in p if isinstance(x, str)]
-        e = body.get("expand")
-        if isinstance(e, bool):
-            expand = e
-
-    results: list[dict] = []
-    if not paths:
-        results = _collect_paths_info(ds_path)
-    else:
-        for p in paths:
-            # Normalize: treat empty string or "/" as root
-            if p.strip() in {"", "/", "."}:
-                if expand:
-                    results.extend(_collect_paths_info(ds_path))
-                else:
-                    results.append({"path": "", "type": "directory"})
-                continue
-            if expand:
-                results.extend(_collect_paths_info(ds_path, p))
-            else:
-                # Only return the path itself (file or dir)
-                norm_rel = p.strip().lstrip("/")
-                abs_target = os.path.abspath(os.path.join(ds_path, norm_rel))
-                if abs_target.startswith(os.path.abspath(ds_path) + os.sep) or abs_target == os.path.abspath(ds_path):
-                    if os.path.isdir(abs_target):
-                        results.append({"path": norm_rel.replace(os.sep, "/"), "type": "directory"})
-                    elif os.path.isfile(abs_target):
-                        results.append({
-                            "path": norm_rel.replace(os.sep, "/"),
-                            "type": "file",
-                            "size": get_file_size(abs_target),
-                        })
-
-    seen = set()
-    unique: list[dict] = []
-    for it in results:
-        key = (it.get("path", ""), it.get("type", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(it)
-
-    return JSONResponse(content=unique)
-
-
-@app.post("/api/models/{repo_id:path}/paths-info/{revision}")
-async def get_model_paths_info(repo_id: str, revision: str, request: Request):
-    """Minimal implementation of the Hub "paths-info" endpoint for models.
-
-    Accepts an optional JSON body: {"paths": ["path1", "path2", ...], "expand": true}
-    Behavior mirrors the dataset variant but rooted at fake_hub/<repo_id>.
-    """
-    repo_path = os.path.join(FAKE_HUB_ROOT, repo_id)
-    if not os.path.isdir(repo_path):
-        raise HTTPException(status_code=404, detail="Repository not found")
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-
-    paths = []
+    paths: list[str] = []
     expand = True
     if isinstance(body, dict):
         p = body.get("paths")
@@ -570,26 +424,26 @@ async def get_model_paths_info(repo_id: str, revision: str, request: Request):
 
     results: list[dict] = []
     if not paths:
-        results = _collect_paths_info(repo_path)
+        results = _collect_paths_info(base_dir)
     else:
         for p in paths:
             if p.strip() in {"", "/", "."}:
                 if expand:
-                    results.extend(_collect_paths_info(repo_path))
+                    results.extend(_collect_paths_info(base_dir))
                 else:
                     results.append({"path": "", "type": "directory"})
                 continue
             if expand:
-                results.extend(_collect_paths_info(repo_path, p))
+                results.extend(_collect_paths_info(base_dir, p))
             else:
                 norm_rel = p.strip().lstrip("/")
-                abs_target = os.path.abspath(os.path.join(repo_path, norm_rel))
-                if abs_target.startswith(os.path.abspath(repo_path) + os.sep) or abs_target == os.path.abspath(repo_path):
+                abs_target = os.path.abspath(os.path.join(base_dir, norm_rel))
+                base_abs = os.path.abspath(base_dir)
+                if abs_target.startswith(base_abs + os.sep) or abs_target == base_abs:
                     if os.path.isdir(abs_target):
                         results.append({"path": norm_rel.replace(os.sep, "/"), "type": "directory"})
                     elif os.path.isfile(abs_target):
-                        # Reuse _collect_paths_info to include size and oid/lfs when possible
-                        file_infos = _collect_paths_info(repo_path, norm_rel)
+                        file_infos = _collect_paths_info(base_dir, norm_rel)
                         for it in file_infos:
                             if it.get("type") == "file":
                                 results.append(it)
@@ -603,8 +457,16 @@ async def get_model_paths_info(repo_id: str, revision: str, request: Request):
             continue
         seen.add(key)
         unique.append(it)
+    return unique
 
-    return JSONResponse(content=unique)
+
+@app.post("/api/models/{repo_id:path}/paths-info/{revision}")
+async def get_model_paths_info(repo_id: str, revision: str, request: Request):
+    """Minimal implementation of the Hub paths-info endpoint for models."""
+    repo_path = os.path.join(FAKE_HUB_ROOT, repo_id)
+    if not os.path.isdir(repo_path):
+        raise HTTPException(status_code=404, detail="Repository not found")
+    return JSONResponse(content=await _paths_info_response(repo_path, request))
 
 
 @app.get("/api/models/{repo_id:path}/revision/{revision}")
