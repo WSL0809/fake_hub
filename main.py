@@ -641,10 +641,50 @@ async def resolve_file_download(repo_id: str, revision: str, filename: str, requ
             "Content-Length": str(size),
             "Content-Type": "application/octet-stream",
             "Accept-Ranges": "bytes",
-            # 兼容性头部（不再计算 ETag）
             "x-repo-commit": revision,
             "x-revision": revision,
         }
+
+        # 仅从 sidecar 读取文件哈希并作为 ETag 返回；若缺失则报 500
+        import json
+
+        repo_root = os.path.join(FAKE_HUB_ROOT, repo_id)
+        sidecar = os.path.join(repo_root, ".paths-info.json")
+        rel_path = filename.replace(os.sep, "/")
+        etag: str | None = None
+        if os.path.isfile(sidecar):
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                entries = data.get("entries") if isinstance(data, dict) else None
+                if isinstance(entries, list):
+                    for it in entries:
+                        if (
+                            isinstance(it, dict)
+                            and it.get("type") == "file"
+                            and it.get("path") == rel_path
+                            and it.get("size") == size
+                        ):
+                            if isinstance(it.get("etag"), str):
+                                etag = it["etag"]
+                            elif isinstance(it.get("oid"), str):
+                                etag = it["oid"]
+                            else:
+                                lfs = it.get("lfs") if isinstance(it.get("lfs"), dict) else None
+                                if lfs and isinstance(lfs.get("oid"), str):
+                                    etag = lfs["oid"].split(":", 1)[-1]
+                            break
+            except Exception as e:
+                _logger.exception("Failed to read %s: %s", sidecar, e)
+        else:
+            _logger.error("Sidecar not found for %s: %s", repo_id, sidecar)
+
+        if not etag:
+            _logger.error("ETag missing for %s@%s:%s", repo_id, revision, rel_path)
+            raise HTTPException(status_code=500, detail="ETag not available")
+
+        headers["ETag"] = f'"{etag}"'
+
         if filename.endswith(".bin"):
             headers["x-lfs-size"] = str(size)
         return Response(status_code=200, headers=headers)
